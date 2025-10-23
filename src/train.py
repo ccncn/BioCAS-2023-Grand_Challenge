@@ -213,10 +213,11 @@ def train_model(
         )
 
         val_results = {
-            "score": val_score,
-            "accuracy": val_acc,
-            "loss": 1 / losses[-1],
-        }
+        "score": val_score,
+        "accuracy": val_acc,
+        "loss": losses[-1],  # ✅ use direct loss, no inversion
+    }
+
 
         for item in strategy:
             if val_results[item] > best_result[item]:
@@ -245,43 +246,61 @@ def train_model(
         torch.save(best_dict, PATH)
 
     return best_dict
-
-
 def calc_accuracy(output, Y, spike=False):
-    """Get batch accuracy of during training.
-    Args:
-        output: output obtained from model.
-        Y: actual/correct labels.
-        spike: True to use spiking output.
-    Returns:
-        train_acc: Training accuracy for that batch.
-    """
+    if isinstance(output, tuple):
+        output, _ = output
     if spike:
         train_acc = SF.acc.accuracy_rate(output[0], Y)
     else:
-        max_vals, max_indices = torch.max(output, 1)
-        train_acc = (max_indices == Y).sum().data.cpu().numpy() / max_indices.size()[0]
+        _, max_indices = torch.max(output, 1)
+        train_acc = (max_indices == Y).sum().item() / max_indices.size(0)
     return train_acc
 
 
 def calc_loss(criterion, output, Y, spike=False):
-    """Get batch loss of during training.
-    Args:
-        criterion: loss function.
-        output: output obtained from model.
-        Y: actual/correct labels.
-        spike: True to use spiking output.
-    Returns:
-        loss_fn(output, Y)
-    """
+    if isinstance(output, tuple):
+        output, _ = output
     if spike:
         return criterion(output[0], Y)
     else:
         return criterion(output, Y)
 
 
+# def calc_accuracy(output, Y, spike=False):
+#     """Get batch accuracy of during training.
+#     Args:
+#         output: output obtained from model.
+#         Y: actual/correct labels.
+#         spike: True to use spiking output.
+#     Returns:
+#         train_acc: Training accuracy for that batch.
+#     """
+#     if spike:
+#         train_acc = SF.acc.accuracy_rate(output[0], Y)
+#     else:
+#         max_vals, max_indices = torch.max(output, 1)
+#         train_acc = (max_indices == Y).sum().data.cpu().numpy() / max_indices.size()[0]
+#     return train_acc
+
+
+# def calc_loss(criterion, output, Y, spike=False):
+#     """Get batch loss of during training.
+#     Args:
+#         criterion: loss function.
+#         output: output obtained from model.
+#         Y: actual/correct labels.
+#         spike: True to use spiking output.
+#     Returns:
+#         loss_fn(output, Y)
+#     """
+#     if spike:
+#         return criterion(output[0], Y)
+#     else:
+#         return criterion(output, Y)
+
+
 def valid_model(device, task, dataloader, trained_model, verbose=False, spike=False):
-    """Post Evaluation Metric Platfrom. Feed in the trained model and train/validation data loader.
+    """Post Evaluation Metric Platform. Feed in the trained model and train/validation data loader.
     Args:
         device: either cpu or cuda for acceleration.
         dataloader: dataloader containing data for evaluation.
@@ -295,7 +314,7 @@ def valid_model(device, task, dataloader, trained_model, verbose=False, spike=Fa
     for data, label, info in dataloader:
         data, label, info = data.to(device), label.to(device), info.to(device)
         x = data
-        outputs = trained_model(x)
+        outputs, _ = trained_model(x)  # <-- unpack outputs and ignore aux_loss
         if spike:
             _, idx = outputs[0].sum(dim=0).max(1)
             preds.append(idx.cpu().numpy().tolist())
@@ -309,11 +328,12 @@ def valid_model(device, task, dataloader, trained_model, verbose=False, spike=Fa
 
     score, *_ = calc_score(truth_flat, preds_flat, verbose, task=task)
     accuracy = accuracy_score(truth_flat, preds_flat)
-    if verbose == True:
+    if verbose:
         print("\nEvaluating....")
         print("Accuracy:", accuracy)
         print(classification_report(truth_flat, preds_flat))
     return score, accuracy
+
 
 
 def mixup_data(x, y, alpha=1.0, use_cuda=True):
@@ -338,7 +358,6 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-
 def train_mixup(
     device,
     task,
@@ -355,6 +374,7 @@ def train_mixup(
     save_ckpt=False,
     model_name=None,
     strategy=["score"],
+    aux_loss_scale=0.01,  # scale factor for MoE aux_loss
 ):
     best_dict = {}
     best_result = {}
@@ -364,61 +384,53 @@ def train_mixup(
     start = time.time()
     print("\nTraining for {} epochs...".format(n_epochs))
     for epoch in range(n_epochs):
-        if verbose == True and epoch % print_every == 0:
+        if verbose and epoch % print_every == 0:
             print("\n\nEpoch {}/{}:".format(epoch + 1, n_epochs))
 
-        if validation == True:
-            evaluation = ["train", "val"]
-        else:
-            evaluation = ["train"]
+        evaluation = ["train", "val"] if validation else ["train"]
 
-        # Each epoch has a training and validation phase
         for phase in evaluation:
             total = 0
             correct = 0
-            if phase == "train":
-                model.train(True)  # Set model to training mode
-            else:
-                model.train(False)  # Set model to evaluate mode
+            model.train(phase == "train")
 
             running_loss = 0.0
             for data, label, info in dataloader[phase]:
                 data, label, info = data.to(device), label.to(device), info.to(device)
 
-                ## mix-up method
+                # Mixup
                 data, label_a, label_b, lam = mixup_data(data, label)
                 data, label_a, label_b = map(Variable, (data, label_a, label_b))
-                # forward + backward + optimize
+
+                # Forward pass
                 x = data
-                outputs = model(x)
+                outputs, aux_loss = model(x)  # <-- handle MoE aux_loss
+
+                # Compute mixup loss + aux_loss
                 loss = mixup_criterion(criterion, outputs, label_a, label_b, lam)
+                loss += aux_loss_scale * aux_loss
+
                 running_loss += loss.item()
+
+                # Accuracy
                 _, predicted = torch.max(outputs.data, 1)
                 total += label.size(0)
-                correct += (lam * predicted.eq(label_a.data).cpu().sum().float()
-                    + (1 - lam) * predicted.eq(label_b.data).cpu().sum().float())
-                acc = 1.*correct / total
+                correct += (lam * predicted.eq(label_a.data).cpu().sum().float() +
+                            (1 - lam) * predicted.eq(label_b.data).cpu().sum().float())
+                acc = correct / total
 
-                # zero the parameter (weight) gradients
+                # Backward + optimize
                 optimizer.zero_grad()
-
-                # backward + optimize only if in training phase
                 if phase == "train":
                     loss.backward()
-                    # update the weights
                     optimizer.step()
-
-                # record loss statistics
-                running_loss += loss.item()
 
             losses.append(running_loss)
 
-            if verbose == True and epoch % print_every == 0:
-                print(
-                    "{} loss: {:.4f} | acc: {:.4f}|".format(phase, running_loss, acc),
-                    end=" ",
-                )
+            if verbose and epoch % print_every == 0:
+                print("{} loss: {:.4f} | acc: {:.4f}".format(phase, running_loss, acc), end=" ")
 
+        # Validation metrics
         val_score, val_acc = valid_model(
             device=device,
             task=int(task[-2]),
@@ -431,7 +443,7 @@ def train_mixup(
         val_results = {
             "score": val_score,
             "accuracy": val_acc,
-            "loss": 1 / losses[-1],
+            "loss": losses[-1],  # ✅ use direct loss, no inversion
         }
 
         for item in strategy:
@@ -443,13 +455,13 @@ def train_mixup(
                     "optimizer_state_dict": optimizer.state_dict(),
                 } | val_results
 
-    if verbose == True:
+    if verbose:
         print("\nFinished Training  | Time:{}".format(time.time() - start))
 
-    if plot_results == True:
+    if plot_results:
         plt.figure(figsize=(10, 10))
         plt.plot(losses[0::2], label="train_loss")
-        if validation == True:
+        if validation:
             plt.plot(losses[1::2], label="validation_loss")
         plt.legend()
         plt.xlabel("Epoch")
@@ -461,3 +473,272 @@ def train_mixup(
         torch.save(best_dict, PATH)
 
     return best_dict
+def train_mixup_moe(
+    device,
+    task,
+    dataloader,
+    model,
+    criterion,
+    optimizer,
+    spike=False,
+    n_epochs=10,
+    print_every=1,
+    verbose=True,
+    plot_results=True,
+    validation=True,
+    save_ckpt=False,
+    model_name=None,
+    strategy=["score"],
+    use_moe=False,
+    aux_loss_weight=0.01,  # Weight for MoE load-balancing loss
+):
+    """
+    Training function with mixup augmentation and MoE support + expert usage & accuracy visualization.
+    """
+    best_dict = {}
+    best_result = {item: 0 for item in strategy}
+    losses = []
+    start = time.time()
+    print(f"\nTraining for {n_epochs} epochs...")
+
+    # ✅ Initialize expert usage and accuracy counters if using MoE
+    if use_moe:
+        num_experts = model.classifier.num_experts
+        total_expert_usage = torch.zeros(num_experts, device=device)
+        expert_correct = torch.zeros(num_experts, device=device)
+        expert_total = torch.zeros(num_experts, device=device)
+
+    for epoch in range(n_epochs):
+        if verbose and epoch % print_every == 0:
+            print(f"\n\nEpoch {epoch + 1}/{n_epochs}:")
+
+        evaluation = ["train", "val"] if validation else ["train"]
+
+        for phase in evaluation:
+            total = 0
+            correct = 0
+            running_loss = 0.0
+            running_aux_loss = 0.0
+
+            if phase == "train":
+                model.train(True)
+            else:
+                model.eval()
+
+            for data, label, info in dataloader[phase]:
+                data, label, info = data.to(device), label.to(device), info.to(device)
+
+                # Mix-up method
+                data, label_a, label_b, lam = mixup_data(data, label)
+                data, label_a, label_b = map(Variable, (data, label_a, label_b))
+
+                # --------------------------
+                # Forward pass
+                # --------------------------
+                if use_moe:
+                    outputs, aux_loss, topk_idx = model(x=data, return_gates=True)
+
+                    # ✅ Track expert usage and accuracy
+                    with torch.no_grad():
+                        _, predicted = torch.max(outputs, 1)
+                        correct_a = predicted.eq(label_a)
+                        correct_b = predicted.eq(label_b)
+                        sample_correct = lam * correct_a.float() + (1 - lam) * correct_b.float()
+
+                    for exp_id in range(model.classifier.num_experts):
+                        # handle both top-1 and top-k gating shapes
+                        mask = (topk_idx == exp_id)
+                        if mask.dim() > 1:  # e.g., [batch_size, k]
+                            mask = mask.any(dim=1)  # reduce to [batch_size]
+                        count = mask.sum()
+                        if count > 0:
+                            total_expert_usage[exp_id] += count
+                            expert_correct[exp_id] += sample_correct[mask].sum()
+                            expert_total[exp_id] += count
+
+                else:
+                    outputs = model(data)
+                    aux_loss = 0.0
+
+                # --------------------------
+                # Compute mixup loss + aux loss
+                # --------------------------
+                loss = mixup_criterion(criterion, outputs, label_a, label_b, lam)
+                if use_moe:
+                    total_loss = loss + aux_loss_weight * aux_loss
+                    running_aux_loss += aux_loss.item()
+                else:
+                    total_loss = loss
+
+                running_loss += loss.item()
+
+                # --------------------------
+                # Compute accuracy (mixup-style)
+                # --------------------------
+                _, predicted = torch.max(outputs.data, 1)
+                total += label.size(0)
+                correct += (
+                    lam * predicted.eq(label_a.data).cpu().sum().float()
+                    + (1 - lam) * predicted.eq(label_b.data).cpu().sum().float()
+                )
+                acc = correct / total
+
+                optimizer.zero_grad()
+                if phase == "train":
+                    total_loss.backward()
+                    optimizer.step()
+
+            losses.append(running_loss)
+
+            if verbose and epoch % print_every == 0:
+                if use_moe:
+                    print(
+                        f"{phase} loss: {running_loss:.4f} | aux_loss: {running_aux_loss:.4f} | acc: {acc:.4f} |",
+                        end=" ",
+                    )
+                else:
+                    print(
+                        f"{phase} loss: {running_loss:.4f} | acc: {acc:.4f} |",
+                        end=" ",
+                    )
+
+        # --------------------------
+        # Validation phase
+        # --------------------------
+        val_score, val_acc = valid_model_moe(
+            device=device,
+            task=int(task[-2]),
+            dataloader=dataloader[evaluation[-1]],
+            trained_model=model,
+            verbose=False,
+            spike=spike,
+            use_moe=use_moe,
+        )
+
+        val_results = {
+            "score": val_score,
+            "accuracy": val_acc,
+            "loss": 1 / losses[-1],
+        }
+
+        # Track best model for each strategy
+        for item in strategy:
+            if val_results[item] > best_result[item]:
+                best_result[item] = val_results[item]
+                best_dict[item] = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                } | val_results
+
+    # --------------------------
+    # Finished Training
+    # --------------------------
+    if verbose:
+        print(f"\nFinished Training  | Time: {time.time() - start:.2f}s")
+
+    # --------------------------
+    # Plot training losses
+    # --------------------------
+    if plot_results:
+        plt.figure(figsize=(10, 6))
+        plt.plot(losses[0::2], label="train_loss")
+        if validation:
+            plt.plot(losses[1::2], label="val_loss")
+        plt.legend()
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Curve")
+        plt.show()
+
+    # --------------------------
+    # ✅ Expert usage + accuracy visualization
+    # --------------------------
+    if use_moe:
+        total_usage = total_expert_usage.cpu().numpy()
+        usage_percent = total_usage / total_usage.sum() * 100
+
+        expert_acc = (expert_correct / (expert_total + 1e-8) * 100).cpu().numpy()
+
+        print("\n📊 Expert Metrics Summary")
+        print("Expert | Usage(%) | Accuracy(%) | Total Samples")
+        print("-" * 45)
+        for i in range(model.classifier.num_experts):
+            print(f"{i:6d} | {usage_percent[i]:8.2f} | {expert_acc[i]:10.2f} | {int(expert_total[i].item())}")
+
+        plt.figure(figsize=(10, 4))
+        plt.subplot(1, 2, 1)
+        plt.bar(range(len(total_usage)), usage_percent, color='skyblue')
+        plt.xlabel("Expert ID")
+        plt.ylabel("Usage (%)")
+        plt.title("Expert Usage Distribution")
+
+        plt.subplot(1, 2, 2)
+        plt.bar(range(len(expert_acc)), expert_acc, color='lightgreen')
+        plt.xlabel("Expert ID")
+        plt.ylabel("Accuracy (%)")
+        plt.title("Expert Accuracy Distribution")
+        plt.tight_layout()
+        plt.show()
+
+    # --------------------------
+    # Save best checkpoint (optional)
+    # --------------------------
+    if save_ckpt:
+        PATH = f"ckpts/{model_name}_CheckPoint_task{task}.pt"
+        torch.save(best_dict, PATH)
+
+    return best_dict
+
+
+
+def valid_model_moe(device, task, dataloader, trained_model, verbose=False, spike=False, use_moe=False):
+    """
+    Post Evaluation Metric Platform with MoE support.
+    
+    Args:
+        device: either cpu or cuda for acceleration.
+        task: task identifier.
+        dataloader: dataloader containing data for evaluation.
+        trained_model: model used for evaluation.
+        verbose: True to enable verbosity.
+        spike: True to use spiking output.
+        use_moe: True if using MoE classifier.
+    
+    Returns:
+        score: evaluation score from calc_score.
+        accuracy: classification accuracy.
+    """
+    truth = []
+    preds = []
+    
+    for data, label, info in dataloader:
+        data, label, info = data.to(device), label.to(device), info.to(device)
+        x = data
+        
+        if use_moe:
+            # MoE model returns outputs and auxiliary loss
+            outputs, _ = trained_model(x)
+        else:
+            outputs = trained_model(x)
+        
+        if spike:
+            _, idx = outputs[0].sum(dim=0).max(1)
+            preds.append(idx.cpu().numpy().tolist())
+        else:
+            _, predicted = torch.max(outputs, 1)
+            preds.append(predicted.cpu().numpy().tolist())
+        truth.append(label.cpu().numpy().tolist())
+
+    preds_flat = [item for sublist in preds for item in sublist]
+    truth_flat = [item for sublist in truth for item in sublist]
+
+    score, *_ = calc_score(truth_flat, preds_flat, verbose, task=task)
+    accuracy = accuracy_score(truth_flat, preds_flat)
+    
+    if verbose == True:
+        print("\nEvaluating....")
+        print("Accuracy:", accuracy)
+        print(classification_report(truth_flat, preds_flat))
+    
+    return score, accuracy
