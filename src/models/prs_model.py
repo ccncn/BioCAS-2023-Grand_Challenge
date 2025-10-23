@@ -2,6 +2,11 @@ import os
 import torch
 import torch.nn as nn
 import src.models as mdl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+
 
 class PRS_classifier(nn.Module):
     def __init__(self, opt, num_classes=10, pretrain=True):
