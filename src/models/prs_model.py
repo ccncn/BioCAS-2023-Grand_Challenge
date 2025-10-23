@@ -8,7 +8,7 @@ class PRS_classifier(nn.Module):
         super().__init__()
         if pretrain == True:
             model_path = os.path.join(opt.save_folder, opt.ckpt)
-            model_info = torch.load(model_path)
+            model_info = torch.load(model_path, weights_only=False)
             self.encoder = mdl.SupConResNet(
                 name=opt.model, 
                 head=opt.head, 
@@ -53,7 +53,38 @@ class PRS_Model(nn.Module):
         encode = self.encoder(x)
         outputs = self.classifier(encode)
         return outputs
-    
+
+class DiffusionGating(nn.Module):
+    """
+    Diffusion-based Gating Mechanism for Mixture-of-Experts (MoE)
+    - Adds decaying noise to features
+    - Learns to denoise through iterative refinement
+    """
+    def __init__(self, dim_in, num_experts, timesteps=5, noise_scale=0.1, temperature=1.5):
+        super().__init__()
+        self.num_experts = num_experts
+        self.timesteps = timesteps
+        self.noise_scale = noise_scale
+        self.temperature = temperature
+
+        self.fc_in = nn.Linear(dim_in, dim_in)
+        self.fc_layers = nn.ModuleList([nn.Linear(dim_in, dim_in) for _ in range(timesteps)])
+        self.fc_out = nn.Linear(dim_in, num_experts)
+        self.norm = nn.LayerNorm(dim_in)
+
+    def forward(self, x):
+        h = F.relu(self.fc_in(x))
+
+        for t, fc in enumerate(self.fc_layers):
+            noise = torch.randn_like(h) * self.noise_scale * (1 - t / self.timesteps)
+            h = h + noise
+            h = self.norm(F.relu(fc(h)))
+
+        gate_logits = self.fc_out(h)
+        gate_probs = F.softmax(gate_logits / self.temperature, dim=-1)
+        return gate_probs
+   
+
 
 #extra class 
 class MoEClassifier(nn.Module):
@@ -63,7 +94,7 @@ class MoEClassifier(nn.Module):
         self.k = k
 
         # Gating network (same idea, but we’ll do top-k selection in forward)
-        self.gate = nn.Linear(dim_in, num_experts)
+        self.gate = DiffusionGating(dim_in, num_experts)
 
         # Expert networks
         self.experts = nn.ModuleList([
@@ -75,62 +106,44 @@ class MoEClassifier(nn.Module):
             for _ in range(num_experts)
         ])
 
-    def forward(self, x):
-        # -----------------
-        # 1) Compute raw gate scores
-        # -----------------
-        gate_logits = self.gate(x)                     # [batch, num_experts]
-        gate_probs = torch.softmax(gate_logits, dim=-1)
-
-        # -----------------
-        # 2) Top-k selection (sparse gating)
-        # -----------------
-        topk_vals, topk_idx = torch.topk(gate_probs, self.k, dim=-1)  # [batch, k]
-
-        # Normalize top-k probs so they sum to 1
+    def forward(self, x, return_gates=False):  # add return_gates flag
+        
+        gate_probs = self.gate(x)
+        topk_vals, topk_idx = torch.topk(gate_probs, self.k, dim=-1)
         topk_vals = topk_vals / torch.sum(topk_vals, dim=-1, keepdim=True)
 
-        # -----------------
-        # 3) Compute outputs from selected experts only
-        # -----------------
         batch_size = x.size(0)
         outputs = torch.zeros(batch_size, self.experts[0][-1].out_features, device=x.device)
 
         for i in range(self.k):
-            idx = topk_idx[:, i]     # [batch]
-            weight = topk_vals[:, i] # [batch]
-
-            # Compute expert outputs
+            idx = topk_idx[:, i]
+            weight = topk_vals[:, i]
             expert_outs = torch.zeros_like(outputs)
             for exp_id in range(self.num_experts):
                 mask = (idx == exp_id)
                 if mask.any():
                     expert_outs[mask] = self.experts[exp_id](x[mask])
-
-            # Weighted sum
             outputs += weight.unsqueeze(-1) * expert_outs
 
-        # -----------------
-        # 4) Auxiliary load-balancing loss (from Switch/Google MoE)
-        # Encourage uniform expert usage
-        # -----------------
-        expert_prob_mean = torch.mean(gate_probs, dim=0)   # [num_experts]
-        # load_balancing_loss = torch.mean(expert_prob_mean * self.num_experts)
-        # Encourage all experts to be used equally
+        # Aux loss
+        expert_prob_mean = torch.mean(gate_probs, dim=0)
         load_balancing_loss = self.num_experts * torch.sum(expert_prob_mean ** 2)
 
+        if return_gates:  # allow returning gate info
+            return outputs, load_balancing_loss, topk_idx
+        else:
+            return outputs, load_balancing_loss
 
-        return outputs, load_balancing_loss
 
 # --------------------------
 # PRS Classifier with MoE
 # --------------------------
 class PRS_classifier2(nn.Module):
-    def __init__(self, opt, num_classes=10, pretrain=True, num_experts=7, hidden_dim=256):
+    def __init__(self, opt, num_classes=10, pretrain=True, num_experts=2, hidden_dim=256):
         super().__init__()
         if pretrain:
             model_path = os.path.join(opt.save_folder, opt.ckpt)
-            model_info = torch.load(model_path)
+            model_info = torch.load(model_path,weights_only=False)
             self.encoder = mdl.SupConResNet(
                 name=opt.model,
                 head=opt.head,
@@ -144,7 +157,6 @@ class PRS_classifier2(nn.Module):
                 feat_dim=opt.embedding_size
             )
 
-        # MoE classifier instead of Linear
         self.classifier = MoEClassifier(
             dim_in=opt.embedding_size,
             num_classes=num_classes,
@@ -152,7 +164,6 @@ class PRS_classifier2(nn.Module):
             hidden_dim=hidden_dim
         )
 
-    def forward(self, x):
+    def forward(self, x, return_gates=False):   #  accept return_gates
         encode = self.encoder(x)
-        outputs, aux_loss = self.classifier(encode)
-        return outputs, aux_loss
+        return self.classifier(encode, return_gates=return_gates)  #  pass through
