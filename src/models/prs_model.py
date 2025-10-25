@@ -59,13 +59,38 @@ class PRS_Model(nn.Module):
         outputs = self.classifier(encode)
         return outputs
 
+# class DiffusionGating(nn.Module):
+#     """
+#     Diffusion-based Gating Mechanism for Mixture-of-Experts (MoE)
+#     - Adds decaying noise to features
+#     - Learns to denoise through iterative refinement
+#     """
+#     def __init__(self, dim_in, num_experts, timesteps=5, noise_scale=0.1, temperature=1.5):
+#         super().__init__()
+#         self.num_experts = num_experts
+#         self.timesteps = timesteps
+#         self.noise_scale = noise_scale
+#         self.temperature = temperature
+
+#         self.fc_in = nn.Linear(dim_in, dim_in)
+#         self.fc_layers = nn.ModuleList([nn.Linear(dim_in, dim_in) for _ in range(timesteps)])
+#         self.fc_out = nn.Linear(dim_in, num_experts)
+#         self.norm = nn.LayerNorm(dim_in)
+
+#     def forward(self, x):
+#         h = F.relu(self.fc_in(x))
+
+#         for t, fc in enumerate(self.fc_layers):
+#             noise = torch.randn_like(h) * self.noise_scale * (1 - t / self.timesteps)
+#             h = h + noise
+#             h = self.norm(F.relu(fc(h)))
+
+#         gate_logits = self.fc_out(h)
+#         gate_probs = F.softmax(gate_logits / self.temperature, dim=-1)
+#         return gate_probs
+
 class DiffusionGating(nn.Module):
-    """
-    Diffusion-based Gating Mechanism for Mixture-of-Experts (MoE)
-    - Adds decaying noise to features
-    - Learns to denoise through iterative refinement
-    """
-    def __init__(self, dim_in, num_experts, timesteps=5, noise_scale=0.1, temperature=1.5):
+    def __init__(self, dim_in, num_experts, timesteps=3, noise_scale=0.03, temperature=1.0):
         super().__init__()
         self.num_experts = num_experts
         self.timesteps = timesteps
@@ -75,20 +100,21 @@ class DiffusionGating(nn.Module):
         self.fc_in = nn.Linear(dim_in, dim_in)
         self.fc_layers = nn.ModuleList([nn.Linear(dim_in, dim_in) for _ in range(timesteps)])
         self.fc_out = nn.Linear(dim_in, num_experts)
-        self.norm = nn.LayerNorm(dim_in)
 
     def forward(self, x):
         h = F.relu(self.fc_in(x))
 
         for t, fc in enumerate(self.fc_layers):
+            # smaller, decaying noise
             noise = torch.randn_like(h) * self.noise_scale * (1 - t / self.timesteps)
             h = h + noise
-            h = self.norm(F.relu(fc(h)))
+            # residual update
+            h = h + F.relu(fc(h))
 
         gate_logits = self.fc_out(h)
         gate_probs = F.softmax(gate_logits / self.temperature, dim=-1)
         return gate_probs
-   
+
 
 
 #extra class 
